@@ -353,6 +353,11 @@ xpc_object_t xpc_array_create(const xpc_object_t* objects, size_t count) {
 };
 
 XPC_EXPORT
+xpc_object_t xpc_array_create_empty(void) {
+	return xpc_array_create(NULL, 0);
+};
+
+XPC_EXPORT
 void xpc_array_set_value(xpc_object_t xarray, size_t index, xpc_object_t value) {
 	if (index == XPC_ARRAY_APPEND) {
 		return xpc_array_append_value(xarray, value);

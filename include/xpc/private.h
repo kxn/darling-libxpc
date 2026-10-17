@@ -35,6 +35,10 @@
 
 __BEGIN_DECLS
 
+XPC_EXPORT xpc_object_t xpc_shmem_create_readonly(const void* region, size_t length);
+XPC_EXPORT size_t xpc_shmem_get_length(xpc_object_t xshmem);
+XPC_EXPORT mach_port_t _xpc_shmem_get_mach_port(xpc_object_t xshmem);
+
 typedef struct {
 
 } *xpc_event_publisher_t;

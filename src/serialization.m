@@ -83,7 +83,7 @@ static size_t descriptor_sizes[] = {
 
 XPC_INLINE
 size_t descriptor_size(mach_msg_descriptor_type_t type) {
-	if (type > sizeof(descriptor_sizes) / sizeof(*descriptor_sizes)) {
+	if (type >= sizeof(descriptor_sizes) / sizeof(*descriptor_sizes)) {
 		return 0;
 	}
 	return descriptor_sizes[type];
@@ -587,7 +587,14 @@ XPC_CLASS_HEADER(deserializer);
 
 		// the `body` pointer now points to the actual serialized XPC data
 		this->buffer = body;
-		this->length = messageSize - ((uintptr_t)body - (uintptr_t)base);
+		size_t payloadOffset = (uintptr_t)body - (uintptr_t)base;
+		// dispatch_mach_msg_get_msg returns the receive-buffer capacity, which
+		// also includes unused space and trailers. Only msgh_size is payload.
+		if (base->header.msgh_size < payloadOffset || base->header.msgh_size > messageSize) {
+			[self release];
+			return nil;
+		}
+		this->length = base->header.msgh_size - payloadOffset;
 	}
 	return self;
 }
@@ -595,7 +602,7 @@ XPC_CLASS_HEADER(deserializer);
 - (BOOL)ensure: (NSUInteger)extraSize
 {
 	XPC_THIS_DECL(deserializer);
-	return extraSize <= this->length - this->offset;
+	return this->offset <= this->length && extraSize <= this->length - this->offset;
 }
 
 - (BOOL)read: (void*)data length: (NSUInteger)length
@@ -626,7 +633,11 @@ XPC_CLASS_HEADER(deserializer);
 - (BOOL)readString: (const char**)string
 {
 	XPC_THIS_DECL(deserializer);
-	return [self consume: strlen(&this->buffer[this->offset]) + 1 region: (const void**)string];
+	if (this->offset >= this->length) return NO;
+	const char* start = (const char*)this->buffer + this->offset;
+	const char* end = memchr(start, '\0', this->length - this->offset);
+	if (!end) return NO;
+	return [self consume: end - start + 1 region: (const void**)string];
 }
 
 - (BOOL)readU32: (uint32_t*)value
@@ -787,6 +798,19 @@ error_out:
 	}
 
 	dict.incomingPort = deserializer.remotePort;
+	// Credentials come only from the kernel-supplied audit trailer, never
+	// from dictionary payload. All receive paths request this trailer.
+	size_t capacity = 0;
+	mach_msg_header_t* header = dispatch_mach_msg_get_msg(message, &capacity);
+	size_t trailerOffset = round_msg(header->msgh_size);
+	if (trailerOffset <= capacity && capacity - trailerOffset >= sizeof(mach_msg_audit_trailer_t)) {
+		mach_msg_audit_trailer_t* trailer = (void*)((char*)header + trailerOffset);
+		if (trailer->msgh_trailer_type == MACH_MSG_TRAILER_FORMAT_0
+			&& trailer->msgh_trailer_size >= sizeof(*trailer)
+			&& trailer->msgh_trailer_size <= capacity - trailerOffset) {
+			[dict setAssociatedAuditToken: &trailer->msgh_audit];
+		}
+	}
 
 	[deserializer release];
 	return [dict autorelease];

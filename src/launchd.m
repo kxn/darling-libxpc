@@ -21,6 +21,130 @@
 #import <launch.h>
 #import <xpc/util.h>
 #import <xpc/private.h>
+#import <xpc/private/launch_service_stats.h>
+#import <xpc/private/service.h>
+#import <xpc/objects/pipe.h>
+#import <xpc/objects/dictionary.h>
+#include <mach/mach_vm.h>
+#include <errno.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+_Static_assert(sizeof(struct launch_service_stats_record) == 59, "native launch record ABI");
+_Static_assert(sizeof(struct launch_service_stats) == 24, "native launch result ABI");
+
+static int launchd_routine(int subsystem, int routine, xpc_object_t request, xpc_object_t* reply) {
+	if (!reply || xpc_get_type(request) != (xpc_type_t)XPC_TYPE_DICTIONARY) return EINVAL;
+	*reply = NULL;
+	xpc_dictionary_set_uint64(request, "subsystem", subsystem);
+	xpc_dictionary_set_uint64(request, "routine", routine);
+	@autoreleasepool {
+		XPC_CLASS(pipe)* pipe = [[XPC_CLASS(pipe) alloc] initWithBootstrapPort: bootstrap_port];
+		if (!pipe) return EPIPE;
+		xpc_object_t response = NULL;
+		int error = [pipe sendMessage: (id)request withSynchronousReply: &response flags: 0 timeout: 5000];
+		[pipe release];
+		if (!error && !response) error = EPROTO;
+		if (!error) {
+			audit_token_t token;
+			xpc_dictionary_get_audit_token(response, &token);
+			if (token.val[5] != 1 || token.val[1] != 0) error = EPERM;
+		}
+		if (!error) error = (int)xpc_dictionary_get_int64(response, "error");
+		if (error) { if (response) xpc_release(response); return error; }
+		*reply = response;
+		return 0;
+	}
+}
+
+XPC_EXPORT
+int _xpc_control_routine(int routine, xpc_object_t request, xpc_object_t* reply) {
+	return launchd_routine(XPC_LAUNCH_STATS_SUBSYSTEM, routine, request, reply);
+}
+
+XPC_EXPORT
+int _xpc_service_routine(int routine, xpc_object_t request, xpc_object_t* reply) {
+	return launchd_routine(XPC_SERVICE_SUBSYSTEM, routine, request, reply);
+}
+
+static int launch_stats_simple(const char* monitor_id, uint32_t capacity, int routine, bool* enabled) {
+	if (!monitor_id || !*monitor_id) return EINVAL;
+	xpc_object_t request = xpc_dictionary_create(NULL, NULL, 0), reply = NULL;
+	if (!request) return ENOMEM;
+	xpc_dictionary_set_string(request, "monitor_id", monitor_id);
+	if (routine == XPC_LAUNCH_STATS_ENABLE) xpc_dictionary_set_uint64(request, "capacity", capacity);
+	int error = _xpc_control_routine(routine, request, &reply);
+	if (!error && enabled) *enabled = xpc_dictionary_get_bool(reply, "enabled");
+	if (reply) xpc_release(reply);
+	xpc_release(request);
+	return error;
+}
+
+XPC_EXPORT
+int launch_service_stats_enable(const char* monitor_id, uint32_t capacity) {
+	if (!capacity) return EINVAL;
+	return launch_stats_simple(monitor_id, capacity, XPC_LAUNCH_STATS_ENABLE, NULL);
+}
+
+XPC_EXPORT
+int launch_service_stats_disable(const char* monitor_id) {
+	return launch_stats_simple(monitor_id, 0, XPC_LAUNCH_STATS_DISABLE, NULL);
+}
+
+XPC_EXPORT
+bool launch_service_stats_is_enabled(const char* monitor_id) {
+	bool enabled = false;
+	return launch_stats_simple(monitor_id, 0, XPC_LAUNCH_STATS_QUERY, &enabled) == 0 && enabled;
+}
+
+XPC_EXPORT
+int _launch_service_stats_copy_impl(const char* monitor_id, uint32_t capacity,
+		struct launch_service_stats* result, uint32_t version) {
+	static const size_t strides[] = {37, 45, 49, 51, 59};
+	if (!monitor_id || !*monitor_id || !result || version < 2 || version > 6 || !capacity) return EINVAL;
+	// Bound physical page conversion in this backend; do not try to populate
+	// hundreds of GB for a malicious uint32 capacity.
+	if (capacity > (1U << 20)) return ENOMEM;
+	size_t page = getpagesize(), length = ((size_t)capacity * 59 + page - 1) & ~(page - 1);
+	mach_vm_address_t buffer = 0;
+	kern_return_t status = mach_vm_allocate(mach_task_self(), &buffer, length, VM_FLAGS_ANYWHERE);
+	if (status != KERN_SUCCESS) return ENOMEM;
+	xpc_object_t shmem = xpc_shmem_create((void*)buffer, length);
+	if (!shmem) { mach_vm_deallocate(mach_task_self(), buffer, length); return ENOTSUP; }
+	xpc_object_t request = xpc_dictionary_create(NULL, NULL, 0), reply = NULL;
+	if (!request) { xpc_release(shmem); mach_vm_deallocate(mach_task_self(), buffer, length); return ENOMEM; }
+	xpc_dictionary_set_string(request, "monitor_id", monitor_id);
+	xpc_dictionary_set_value(request, "shmem", shmem);
+	xpc_release(shmem);
+	int error = _xpc_control_routine(XPC_LAUNCH_STATS_COPY, request, &reply);
+	struct launch_service_stats output = {0};
+	if (!error) {
+		uint64_t count = xpc_dictionary_get_uint64(reply, "count");
+		uint64_t dropped = xpc_dictionary_get_uint64(reply, "dropped-count");
+		xpc_object_t labels = xpc_dictionary_get_value(reply, "labels");
+		if (count > length / 59 || count > UINT32_MAX || dropped > UINT32_MAX
+			|| xpc_get_type(labels) != (xpc_type_t)XPC_TYPE_ARRAY) error = EPROTO;
+		if (!error) {
+			output.count = count; output.dropped_count = dropped;
+			output.labels = xpc_retain(labels);
+			if (count) {
+				size_t stride = strides[version - 2];
+				output.records = malloc(count * stride);
+				if (!output.records) error = ENOMEM;
+				else for (size_t i = 0; i < count; ++i) {
+					memcpy((char*)output.records + i * stride, (char*)buffer + i * 59, stride);
+				}
+			}
+		}
+	}
+	if (reply) xpc_release(reply);
+	xpc_release(request);
+	mach_vm_deallocate(mach_task_self(), buffer, length);
+	if (error) { if (output.labels) xpc_release(output.labels); free(output.records); }
+	else *result = output;
+	return error;
+}
 
 //
 // private C API

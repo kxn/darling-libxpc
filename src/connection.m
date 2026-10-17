@@ -28,6 +28,7 @@
 #include <xpc/serialization.h>
 #import <objc/runtime.h>
 #include <Block.h>
+#include <errno.h>
 
 XPC_CLASS_SYMBOL_DECL(connection);
 
@@ -164,6 +165,13 @@ static void dispatch_mach_handler(void* context, dispatch_mach_reason_t reason, 
 	xpc_log_debug(connection, "connection %p: handler got event %lu (%s)\n", self, reason, reason_to_string(reason));
 
 	switch (reason) {
+		case DISPATCH_MACH_MESSAGE_SENT:
+			// A successful send already consumed the MOVE rights and OOL
+			// resources. The message object only owns its buffer now; destroying
+			// its contents again can destroy a receive right transferred to a
+			// peer in this same task (including our own service check-in).
+			break;
+
 		case DISPATCH_MACH_MESSAGE_RECEIVED: {
 			mach_msg_header_t* header = dispatch_mach_msg_get_msg(message, NULL);
 
@@ -240,9 +248,9 @@ static void dispatch_mach_handler(void* context, dispatch_mach_reason_t reason, 
 
 		case DISPATCH_MACH_CANCELED: {
 			// we should only ever receive a single DISPATCH_MACH_CANCELED event
-			xpc_assert(!this->is_cancelled);
+			xpc_assert(!atomic_load_explicit(&this->is_cancelled, memory_order_relaxed));
 
-			this->is_cancelled = true;
+			atomic_store_explicit(&this->is_cancelled, true, memory_order_release);
 			[self.parentServer removeServerPeer: self]; // server peers should unregister themselves from their parent servers
 			xpc_log_debug(connection, "connection %p: cancelled", self);
 
@@ -378,7 +386,7 @@ static void dmxh_async_reply_handler(void* self_context, dispatch_mach_reason_t 
 				// if the message is only a header, it means that the remote peer disconnected/crashed
 				xpc_log(connection, "connection %p: async reply handler received empty message due to peer disconnect", this);
 				mach_msg_destroy(header);
-				if (this->service_name) {
+				if (this->service_name && !atomic_load_explicit(&this->invalidating, memory_order_acquire)) {
 					result = XPC_ERROR_CONNECTION_INTERRUPTED;
 				} else {
 					result = XPC_ERROR_CONNECTION_INVALID;
@@ -397,7 +405,7 @@ static void dmxh_async_reply_handler(void* self_context, dispatch_mach_reason_t 
 		case DISPATCH_MACH_ASYNC_WAITER_DISCONNECTED: {
 			xpc_log(connection, "connection %p: async reply handler was informed that we were cancelled while waiting", this);
 			mach_msg_destroy(header);
-			if (this->service_name) {
+			if (this->service_name && !atomic_load_explicit(&this->invalidating, memory_order_acquire)) {
 				result = XPC_ERROR_CONNECTION_INTERRUPTED;
 			} else {
 				result = XPC_ERROR_CONNECTION_INVALID;
@@ -603,6 +611,8 @@ OS_OBJECT_USES_XREF_DISPOSE();
 	pthread_rwlock_init(&this->remote_credentials_lock, NULL);
 
 	this->suspension_count = 1;
+	atomic_init(&this->is_cancelled, false);
+	atomic_init(&this->invalidating, false);
 
 	xpc_genarr_connection_init(&this->server_peers, true, server_peer_array_item_dtor);
 
@@ -798,7 +808,15 @@ out:
 error_out:
 	xpc_mach_port_release_send(this->send_port);
 	xpc_mach_port_release_receive(this->recv_port);
-	this->activated = false;
+	this->send_port = MACH_PORT_NULL;
+	this->recv_port = MACH_PORT_NULL;
+	// A failed bootstrap lookup/check-in is terminal for this connection.
+	// Activate the empty channel before canceling it so dispatch can dispose
+	// queued messages and complete synchronous/asynchronous reply waiters.
+	atomic_store_explicit(&this->invalidating, true, memory_order_release);
+	this->activated = true;
+	dispatch_mach_connect(this->mach_ctx, MACH_PORT_NULL, MACH_PORT_NULL, NULL);
+	dispatch_mach_cancel(this->mach_ctx);
 }
 
 - (BOOL)activate
@@ -882,6 +900,7 @@ error_out:
 - (void)cancel
 {
 	XPC_THIS_DECL(connection);
+	atomic_store_explicit(&this->invalidating, true, memory_order_release);
 	this->suspension_count = 0;
 	dispatch_mach_cancel(this->mach_ctx);
 }
@@ -988,7 +1007,7 @@ error_out:
 	}
 
 	if (!reply) {
-		if (this->service_name) {
+		if (this->service_name && !atomic_load_explicit(&this->invalidating, memory_order_acquire)) {
 			return XPC_ERROR_CONNECTION_INTERRUPTED;
 		} else {
 			return XPC_ERROR_CONNECTION_INVALID;
@@ -1000,7 +1019,7 @@ error_out:
 	if (header->msgh_size == sizeof(mach_msg_header_t)) {
 		// if the message is only a header, it means that the remote peer disconnected/crashed
 		mach_msg_destroy(header);
-		if (this->service_name) {
+		if (this->service_name && !atomic_load_explicit(&this->invalidating, memory_order_acquire)) {
 			return XPC_ERROR_CONNECTION_INTERRUPTED;
 		} else {
 			return XPC_ERROR_CONNECTION_INVALID;
@@ -1128,6 +1147,32 @@ void xpc_connection_cancel(xpc_connection_t xconn) {
 	TO_OBJC_CHECKED(connection, xconn, conn) {
 		return [conn cancel];
 	}
+};
+
+XPC_EXPORT
+char* xpc_connection_copy_invalidation_reason(xpc_connection_t xconn) {
+	TO_OBJC_CHECKED(connection, xconn, conn) {
+		struct xpc_connection_s* value = (void*)conn;
+		if (!atomic_load_explicit(&value->is_cancelled, memory_order_acquire)) {
+			return NULL;
+		}
+		// This backend publishes invalidation in DISPATCH_MACH_CANCELED before
+		// calling the event handler. It has no detailed modern reason codes.
+		return strdup("Connection cancelled by the Darling XPC backend");
+	}
+	return NULL;
+};
+
+XPC_EXPORT
+int xpc_connection_set_peer_code_signing_requirement(xpc_connection_t xconn, const char* requirement) {
+	TO_OBJC_CHECKED(connection, xconn, conn) {
+		(void)conn;
+		if (!requirement) return EINVAL;
+		// No message-signature enforcement exists here. Report unsupported
+		// without modifying the connection or accepting a requirement.
+		return ENOTSUP;
+	}
+	return EINVAL;
 };
 
 XPC_EXPORT

@@ -21,15 +21,22 @@
 #define _XPC_OBJECTS_SERVICE_H_
 
 #import <xpc/objects/base.h>
+#import <dispatch/dispatch.h>
 
 XPC_CLASS_DECL(service);
 
 struct xpc_service_s {
 	struct xpc_object_s base;
+	char* name;
+	uint64_t handle;
+	int kind;
+	uint32_t domain;
+	dispatch_queue_t queue;
 };
 
 @interface XPC_CLASS_INTERFACE(service)
-
+- (instancetype)initWithName: (const char*)name kind: (int)kind domain: (uint32_t)domain
+                      handle: (uint64_t)handle queue: (dispatch_queue_t)queue;
 @end
 
 #endif // _XPC_OBJECTS_SERVICE_H_

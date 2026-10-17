@@ -89,7 +89,9 @@ struct xpc_connection_s {
 	xpc_handler_t event_handler;
 	xpc_finalizer_t finalizer;
 	atomic_intmax_t suspension_count;
-	bool is_cancelled;
+	atomic_bool is_cancelled;
+	// Latched before dispatch delivers cancellation, including failed activation.
+	atomic_bool invalidating;
 
 	//
 	// other

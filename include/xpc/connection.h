@@ -44,6 +44,8 @@ typedef void (*xpc_finalizer_t)(void *value);
 
 void xpc_connection_activate(xpc_connection_t connection);
 void xpc_connection_cancel(xpc_connection_t connection);
+char* xpc_connection_copy_invalidation_reason(xpc_connection_t connection);
+int xpc_connection_set_peer_code_signing_requirement(xpc_connection_t connection, const char* requirement);
 xpc_connection_t xpc_connection_create(const char *name, dispatch_queue_t targetq);
 xpc_connection_t xpc_connection_create_from_endpoint(xpc_endpoint_t endpoint);
 xpc_connection_t xpc_connection_create_mach_service(const char *name, dispatch_queue_t targetq, uint64_t flags);

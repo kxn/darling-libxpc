@@ -121,6 +121,7 @@ typedef void (*xpc_connection_handler_t)(xpc_connection_t connection);
 #endif
 
 xpc_object_t xpc_array_create(xpc_object_t  _Nonnull const *objects, size_t count);
+xpc_object_t xpc_array_create_empty(void);
 xpc_object_t xpc_bool_create(bool value);
 xpc_object_t xpc_data_create(const void *bytes, size_t length);
 xpc_object_t xpc_date_create(int64_t interval);
@@ -130,6 +131,8 @@ xpc_object_t xpc_fd_create(int fd);
 xpc_object_t xpc_int64_create(int64_t value);
 xpc_object_t xpc_null_create(void);
 xpc_object_t xpc_pointer_create(void* value);
+xpc_object_t xpc_shmem_create(void* region, size_t length);
+size_t xpc_shmem_map(xpc_object_t xshmem, void** region);
 xpc_object_t xpc_string_create(const char *string);
 xpc_object_t xpc_string_create_with_format_and_arguments(const char *fmt, va_list ap);
 xpc_object_t xpc_string_create_with_format(const char* format, ...);

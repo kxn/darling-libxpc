@@ -64,8 +64,11 @@ struct xpc_pipe_s {
 
 - (instancetype)initForService: (const char*)serviceName withFlags: (uint64_t)flags;
 - (instancetype)initWithPort: (mach_port_t)port flags: (uint64_t)flags;
+// Bootstrap already speaks the pipe protocol; it does not use service checkin.
+- (instancetype)initWithBootstrapPort: (mach_port_t)port;
 
 - (int)sendMessage: (XPC_CLASS(dictionary)*)message withSynchronousReply: (xpc_object_t*)reply flags: (uint64_t)flags;
+- (int)sendMessage: (XPC_CLASS(dictionary)*)message withSynchronousReply: (xpc_object_t*)reply flags: (uint64_t)flags timeout: (mach_msg_timeout_t)timeout;
 - (int)sendMessage: (XPC_CLASS(dictionary)*)message withReplyPort: (mach_port_t)replyPort;
 - (int)forwardMessage: (XPC_CLASS(dictionary)*)message;
 - (int)sendMessage: (XPC_CLASS(dictionary)*)message;

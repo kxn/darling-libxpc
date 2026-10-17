@@ -209,7 +209,7 @@ out:
 				goto out;
 			}
 
-			*incomingMessage = dict;
+			*incomingMessage = [dict retain];
 
 			status = 0;
 		} else {
@@ -249,7 +249,7 @@ out:
 				goto out;
 			}
 
-			*incomingMessage = dict;
+			*incomingMessage = [dict retain];
 			*replyPort = header->msgh_local_port;
 
 			status = 0;
@@ -428,6 +428,21 @@ out:
 	return self;
 }
 
+- (instancetype)initWithBootstrapPort: (mach_port_t)port
+{
+	if (self = [super init]) {
+		XPC_THIS_DECL(pipe);
+		pthread_rwlock_init(&this->state_lock, NULL);
+		if (xpc_mach_port_retain_send(port) != KERN_SUCCESS) {
+			[self release];
+			return nil;
+		}
+		this->send_port = port;
+		this->state = xpc_pipe_state_active;
+	}
+	return self;
+}
+
 - (int)activateLocked
 {
 	XPC_THIS_DECL(pipe);
@@ -508,6 +523,11 @@ out:
 
 - (int)sendMessage: (XPC_CLASS(dictionary)*)contents withSynchronousReply: (xpc_object_t*)reply flags: (uint64_t)flags
 {
+	return [self sendMessage: contents withSynchronousReply: reply flags: flags timeout: 0];
+}
+
+- (int)sendMessage: (XPC_CLASS(dictionary)*)contents withSynchronousReply: (xpc_object_t*)reply flags: (uint64_t)flags timeout: (mach_msg_timeout_t)timeout
+{
 	XPC_THIS_DECL(pipe);
 	int status = 0;
 	mach_port_t replyPort = MACH_PORT_NULL;
@@ -558,7 +578,14 @@ out:
 
 retry:
 	// do the send and receive at the same time as an optimization
-	ret = mach_msg(header, (sent ? 0 : MACH_SEND_MSG) | MACH_RCV_MSG | MACH_RCV_LARGE | MACH_RCV_TRAILER_TYPE(MACH_MSG_TRAILER_FORMAT_0) | MACH_RCV_TRAILER_ELEMENTS(MACH_RCV_TRAILER_AUDIT), sent ? 0 : messageSize, messageSize, replyPort, 0, MACH_PORT_NULL);
+	ret = mach_msg(header, (sent ? 0 : MACH_SEND_MSG) | MACH_RCV_MSG | MACH_RCV_LARGE | (timeout ? MACH_RCV_TIMEOUT : 0) | MACH_RCV_TRAILER_TYPE(MACH_MSG_TRAILER_FORMAT_0) | MACH_RCV_TRAILER_ELEMENTS(MACH_RCV_TRAILER_AUDIT), sent ? 0 : messageSize, messageSize, replyPort, timeout, MACH_PORT_NULL);
+	if (ret == MACH_RCV_TIMED_OUT) {
+		// Discard the reply port so a late response cannot become another
+		// synchronous request's reply on this thread.
+		mig_dealloc_reply_port(replyPort);
+		status = ETIMEDOUT;
+		goto out;
+	}
 	sent = YES;
 
 	status = [[self class] handleMachMessageSendReturnCode: ret withMessageHeader: header];
@@ -581,7 +608,7 @@ retry:
 					goto out;
 				}
 
-				*reply = dict;
+				*reply = [dict retain];
 
 				status = 0;
 			} else {

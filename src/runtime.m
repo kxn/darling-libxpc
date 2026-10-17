@@ -71,6 +71,12 @@ bool _xpc_runtime_is_app_sandboxed(void) {
 	return false;
 };
 
+// The pinned original Intel libxpc entry is exactly `ret` (one byte). It is
+// a notification hook, separate from container-path/app-sandbox detection.
+XPC_EXPORT
+void _xpc_runtime_process_has_entered_sandbox(void) {
+}
+
 static xpc_service_runloop_type_t runloop_name_to_type(const char* name) {
 	if (!name) {
 		return xpc_service_runloop_type_dispatch;

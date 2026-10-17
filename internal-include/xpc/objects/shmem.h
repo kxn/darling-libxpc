@@ -21,14 +21,23 @@
 #define _XPC_OBJECTS_SHMEM_H_
 
 #import <xpc/objects/base.h>
+#include <mach/port.h>
 
 XPC_CLASS_DECL(shmem);
 
 struct xpc_shmem_s {
 	struct xpc_object_s base;
+	mach_port_t port;
+	size_t length;
 };
 
 @interface XPC_CLASS_INTERFACE(shmem)
+
+// Takes ownership of one send-right reference, even if initialization fails.
+- (instancetype)initWithOwnedPort: (mach_port_t)port length: (size_t)length;
+- (size_t)mapRegion: (void**)region;
+@property(readonly) mach_port_t port;
+@property(readonly) size_t length;
 
 @end
 
