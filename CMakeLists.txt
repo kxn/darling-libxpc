@@ -43,6 +43,7 @@ set(xpc_sources
 	src/double.m
 	src/endpoint.m
 	src/error.m
+	src/peer_error.m
 	src/event.m
 	src/fd.m
 	src/file_transfer.m

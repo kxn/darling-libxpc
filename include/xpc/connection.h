@@ -35,6 +35,7 @@ __BEGIN_DECLS
 XPC_EXPORT const struct _xpc_dictionary_s _xpc_error_connection_interrupted;
 XPC_EXPORT const struct _xpc_dictionary_s _xpc_error_connection_invalid;
 XPC_EXPORT const struct _xpc_dictionary_s _xpc_error_termination_imminent;
+XPC_EXPORT const struct _xpc_dictionary_s _xpc_error_peer_code_signing_requirement;
 
 #define XPC_ERROR_CONNECTION_INTERRUPTED XPC_GLOBAL_OBJECT(_xpc_error_connection_interrupted)
 #define XPC_ERROR_CONNECTION_INVALID XPC_GLOBAL_OBJECT(_xpc_error_connection_invalid)
