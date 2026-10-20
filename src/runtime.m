@@ -30,6 +30,7 @@
 #import <objc/runtime.h>
 
 #import <Foundation/NSRunLoop.h>
+#import <Foundation/NSBundle.h>
 #import <dlfcn.h>
 #import <AppKit/NSApplication.h>
 #import <crt_externs.h>
@@ -186,7 +187,17 @@ void xpc_main(xpc_connection_handler_t handler) {
 
 XPC_EXPORT
 void xpc_init_services(void) {
-	xpc_stub();
+	@autoreleasepool {
+		/* Foundation supplies its loaded-bundle snapshot. Do not send launchd
+		 * requests from a dyld image callback while the loader lock is held. */
+		Class bundleClass = objc_getClass("NSBundle");
+		if (!bundleClass) return;
+		for (NSBundle* bundle in [bundleClass allFrameworks]) {
+			xpc_add_bundle([[bundle bundlePath] UTF8String], 0);
+		}
+		NSBundle* main = [bundleClass mainBundle];
+		if (main) xpc_add_bundle([[main bundlePath] UTF8String], 0);
+	}
 };
 
 XPC_EXPORT

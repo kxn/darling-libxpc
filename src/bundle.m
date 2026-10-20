@@ -29,10 +29,59 @@
 #include <Block.h>
 #include <sys/stat.h>
 #include <dirent.h>
+#include <launch.h>
+#include <errno.h>
+#include <unistd.h>
 
 #define INFO_DICT_XPC_SERVICE_KEY "XPCService"
 
 XPC_CLASS_SYMBOL_DECL(bundle);
+
+@interface XPC_CLASS(bundle) (UserServices)
+- (int)registerUserServices;
+@end
+
+/* Register a real on-demand launchd job, rather than inventing a send right.
+ * launchd owns its lifetime and performs bootstrap check-in/activation. */
+static int register_user_service(XPC_CLASS(bundle)* bundle)
+{
+	const char* identifier = [bundle.infoDictionary stringForKey: "CFBundleIdentifier"].CString;
+	const char* executable = bundle.executablePath.CString;
+	const char* kind = [bundle.infoDictionary stringForKey: "CFBundlePackageType"].CString;
+	if (bundle.error || !identifier || !identifier[0] || !executable ||
+	    !kind || strcmp(kind, "XPC!") != 0) return EINVAL;
+	xpc_object_t service = [bundle.infoDictionary objectForKey: "XPCService"];
+	if (xpc_get_type(service) != (xpc_type_t)XPC_TYPE_DICTIONARY) return EINVAL;
+	const char* service_type = xpc_dictionary_get_string(service, "ServiceType");
+	/* Application-scoped and system services need their respective domains. */
+	if (!service_type || strcmp(service_type, "User") != 0) return ENOTSUP;
+	if (access(executable, X_OK) != 0) return errno;
+	launch_data_t job = launch_data_alloc(LAUNCH_DATA_DICTIONARY);
+	launch_data_t args = launch_data_alloc(LAUNCH_DATA_ARRAY);
+	launch_data_t services = launch_data_alloc(LAUNCH_DATA_DICTIONARY);
+	launch_data_t request = launch_data_alloc(LAUNCH_DATA_DICTIONARY);
+	if (!job || !args || !services || !request) {
+		if (job) launch_data_free(job);
+		if (args) launch_data_free(args);
+		if (services) launch_data_free(services);
+		if (request) launch_data_free(request);
+		return ENOMEM;
+	}
+	launch_data_dict_insert(job, launch_data_new_string(identifier), LAUNCH_JOBKEY_LABEL);
+	launch_data_dict_insert(job, launch_data_new_string(executable), LAUNCH_JOBKEY_PROGRAM);
+	launch_data_array_set_index(args, launch_data_new_string(executable), 0);
+	launch_data_dict_insert(job, args, LAUNCH_JOBKEY_PROGRAMARGUMENTS);
+	launch_data_dict_insert(services, launch_data_new_bool(true), identifier);
+	launch_data_dict_insert(job, services, LAUNCH_JOBKEY_MACHSERVICES);
+	launch_data_dict_insert(job, launch_data_new_bool(true), LAUNCH_JOBKEY_ONDEMAND);
+	launch_data_dict_insert(request, job, LAUNCH_KEY_SUBMITJOB);
+	launch_data_t reply = launch_msg(request);
+	int error = reply ? (launch_data_get_type(reply) == LAUNCH_DATA_ERRNO ?
+	                   launch_data_get_errno(reply) : EPROTO) : (errno ? errno : EIO);
+	if (reply) launch_data_free(reply);
+	launch_data_free(request);
+	return error == EEXIST ? 0 : error;
+}
 
 OS_OBJECT_NONLAZY_CLASS
 @implementation XPC_CLASS(bundle)
@@ -55,7 +104,8 @@ XPC_CLASS_HEADER(bundle);
 	// in either case, however, we can tell if it's the bundle root if it contains an Info.plist (it's required for all bundles).
 	// the difference is just in whether it's directly in the root or in a `Contents` directory.
 	if (strcmp(path.pathExtension, "framework") == 0) {
-		if (xpc_path_is_file([path stringByAppendingPathComponent: "Info.plist"].CString)) {
+		if (xpc_path_is_file([path stringByAppendingPathComponent: "Resources/Info.plist"].CString) ||
+		    xpc_path_is_file([path stringByAppendingPathComponent: "Info.plist"].CString)) {
 			return YES;
 		}
 	} else {
@@ -75,6 +125,19 @@ XPC_CLASS_HEADER(bundle);
 		path = [path stringByDeletingLastPathComponent];
 	}
 	return nil;
+}
+
+- (int)registerUserServices
+{
+	XPC_THIS_DECL(bundle);
+	const char* kind = [self.infoDictionary stringForKey: "CFBundlePackageType"].CString;
+	if (kind && strcmp(kind, "XPC!") == 0) return register_user_service(self);
+	int error = 0;
+	for (XPC_CLASS(bundle)* service in this->services) {
+		int next = register_user_service(service);
+		if (!error) error = next;
+	}
+	return error;
 }
 
 - (void)dealloc
@@ -150,7 +213,9 @@ XPC_CLASS_HEADER(bundle);
 {
 	XPC_CLASS(string)* path = nil;
 	if (self.isFramework) {
-		path = [self.bundlePath stringByAppendingPathComponent: "Info.plist"];
+		path = [self.bundlePath stringByAppendingPathComponent: "Resources/Info.plist"];
+		if (!xpc_path_is_file(path.CString))
+			path = [self.bundlePath stringByAppendingPathComponent: "Info.plist"];
 	} else {
 		path = [self.bundlePath stringByAppendingPathComponent: "Contents/Info.plist"];
 	}
@@ -472,7 +537,17 @@ void xpc_bundle_resolve_sync(xpc_object_t xbundle) {
 
 XPC_EXPORT
 void xpc_add_bundle(const char* path, unsigned int flags) {
-	xpc_stub();
+	if (!path || path[0] != '/') { errno = EINVAL; return; }
+	if (flags != 0) { errno = ENOTSUP; return; }
+	@autoreleasepool {
+		XPC_CLASS(string)* string = [[XPC_CLASS(string) alloc] initWithCString: path];
+		XPC_CLASS(bundle)* bundle = [[XPC_CLASS(bundle) alloc] initWithPath: string];
+		[string release];
+		[bundle resolve];
+		int error = bundle.error ? EINVAL : [bundle registerUserServices];
+		[bundle release];
+		errno = error;
+	}
 };
 
 XPC_EXPORT

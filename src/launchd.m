@@ -25,6 +25,8 @@
 #import <xpc/private/service.h>
 #import <xpc/objects/pipe.h>
 #import <xpc/objects/dictionary.h>
+#import <xpc/objects/bundle.h>
+#import <xpc/objects/string.h>
 #include <mach/mach_vm.h>
 #include <errno.h>
 #include <stdlib.h>
@@ -275,11 +277,44 @@ int launch_get_system_service_enabled(const char* name, bool* out_loaded, bool* 
 	return -1;
 };
 
+/* Resolve metadata from the job launchd actually registered. Querying a
+ * random installed bundle must not report a service as registered. */
+static char* user_service_bundle_metadata(const char* name, bool version)
+{
+	if (!name || !name[0]) { errno = EINVAL; return NULL; }
+	launch_data_t request = launch_data_alloc(LAUNCH_DATA_DICTIONARY);
+	if (!request) { errno = ENOMEM; return NULL; }
+	launch_data_dict_insert(request, launch_data_new_string(name), LAUNCH_KEY_GETJOB);
+	launch_data_t reply = launch_msg(request);
+	launch_data_free(request);
+	if (!reply) return NULL;
+	char* result = NULL;
+	int error = ENOENT;
+	if (launch_data_get_type(reply) == LAUNCH_DATA_DICTIONARY) {
+		launch_data_t program = launch_data_dict_lookup(reply, LAUNCH_JOBKEY_PROGRAM);
+		if (program && launch_data_get_type(program) == LAUNCH_DATA_STRING) {
+			@autoreleasepool {
+				XPC_CLASS(string)* path = [[XPC_CLASS(string) alloc] initWithCString: launch_data_get_string(program)];
+				XPC_CLASS(bundle)* bundle = [[XPC_CLASS(bundle) alloc] initWithPath: path];
+				[path release];
+				[bundle resolve];
+				const char* value = version ? [bundle.infoDictionary stringForKey: "CFBundleVersion"].CString : bundle.bundlePath.CString;
+				if (!bundle.error && value) { result = strdup(value); error = result ? 0 : ENOMEM; }
+				[bundle release];
+			}
+		}
+	} else if (launch_data_get_type(reply) == LAUNCH_DATA_ERRNO) {
+		error = launch_data_get_errno(reply);
+		if (!error) error = ENOENT;
+	}
+	launch_data_free(reply);
+	errno = error;
+	return result;
+}
+
 XPC_EXPORT
 char* launch_path_for_user_service_4coresim(const char* name) {
-	// returns a string that must be freed
-	xpc_stub();
-	return NULL;
+	return user_service_bundle_metadata(name, false);
 };
 
 XPC_EXPORT const char* launch_perfcheck_property_endpoint_active = "XPCServiceEndpointActive";
@@ -325,9 +360,7 @@ int launch_set_system_service_enabled(const char* name, bool enabled) {
 
 XPC_EXPORT
 char* launch_version_for_user_service_4coresim(const char* name) {
-	// returns a string that must be freed
-	xpc_stub();
-	return NULL;
+	return user_service_bundle_metadata(name, true);
 };
 
 xpc_object_t ld2xpc(launch_data_t data);

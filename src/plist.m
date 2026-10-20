@@ -871,23 +871,37 @@ XPC_CLASS_HEADER(plist_binary_v0_deserializer);
 
 - (XPC_CLASS(string)*)readUTF16String: (const uint8_t*)object
 {
+	XPC_THIS_DECL(plist_binary_v0_deserializer);
+	/* Binary plist string lengths count UTF-16 code units, not bytes. */
+	if (this->offset_table_offset > this->length) return nil;
+	uintptr_t offset = (uintptr_t)object - (uintptr_t)this->data;
+	if (offset >= this->offset_table_offset) return nil;
+	NSUInteger remaining = this->offset_table_offset - offset;
+	if ((object[0] & 0x0f) == 0x0f) {
+		if (remaining < 2 || (object[1] & 0x0f) > 3 ||
+		    remaining < 2 + (1UL << (object[1] & 0x0f))) return nil;
+	}
 	const uint8_t* bytes = NULL;
 	NSUInteger length = [self readLength: object dataStart: &bytes];
-	dispatch_data_t data = NULL;
-	dispatch_data_t transformed = NULL;
+	if (length == NSUIntegerMax || length > NSUIntegerMax / 2) return nil;
+	NSUInteger byteLength = length * 2;
+	uintptr_t byteOffset = (uintptr_t)bytes - (uintptr_t)this->data;
+	if (byteOffset > this->offset_table_offset ||
+	    byteLength > this->offset_table_offset - byteOffset) return nil;
+	if (!length) return [[XPC_CLASS(string) alloc] initWithCString: "" byteLength: 0];
+
+	dispatch_data_t data = dispatch_data_create(bytes, byteLength, NULL, DISPATCH_DATA_DESTRUCTOR_NONE);
+	if (!data) return nil;
+	dispatch_data_t transformed = dispatch_data_create_with_transform(data,
+		DISPATCH_DATA_FORMAT_TYPE_UTF16BE, DISPATCH_DATA_FORMAT_TYPE_UTF8);
 	XPC_CLASS(string)* result = nil;
-
-	if (length == NSUIntegerMax) {
-		return nil;
+	if (transformed) {
+		const char* flattened = dispatch_data_get_flattened_bytes_4libxpc(transformed);
+		if (flattened) result = [[XPC_CLASS(string) alloc] initWithCString: flattened
+			byteLength: dispatch_data_get_size(transformed)];
+		[transformed release];
 	}
-
-	data = dispatch_data_create(bytes, length, NULL, DISPATCH_DATA_DESTRUCTOR_NONE);
-	// how nice of them to have something specifically for this purpose :)
-	transformed = dispatch_data_create_with_transform(data, DISPATCH_DATA_FORMAT_TYPE_UTF16BE, DISPATCH_DATA_FORMAT_TYPE_UTF8);
-	result = [[XPC_CLASS(string) alloc] initWithCString: dispatch_data_get_flattened_bytes_4libxpc(transformed) byteLength: dispatch_data_get_size(transformed)];
-	[transformed release];
 	[data release];
-
 	return result;
 }
 
