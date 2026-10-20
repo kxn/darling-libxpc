@@ -56,6 +56,42 @@ static int register_user_service(XPC_CLASS(bundle)* bundle)
 	/* Application-scoped and system services need their respective domains. */
 	if (!service_type || strcmp(service_type, "User") != 0) return ENOTSUP;
 	if (access(executable, X_OK) != 0) return errno;
+	launch_data_t environment = launch_data_alloc(LAUNCH_DATA_DICTIONARY);
+	if (!environment) return ENOMEM;
+	xpc_object_t requested = xpc_dictionary_get_value(service, "EnvironmentVariables");
+	__block int environment_error = 0;
+	if (requested && xpc_get_type(requested) != (xpc_type_t)XPC_TYPE_DICTIONARY)
+		environment_error = EINVAL;
+	else if (requested) xpc_dictionary_apply(requested, ^bool(const char* key, xpc_object_t value) {
+		if (!key[0] || strchr(key, '=') || xpc_get_type(value) != (xpc_type_t)XPC_TYPE_STRING) {
+			environment_error = EINVAL;
+			return false;
+		}
+		launch_data_t text = launch_data_new_string(xpc_string_get_string_ptr(value));
+		if (!text || !launch_data_dict_insert(environment, text, key)) {
+			if (text) launch_data_free(text);
+			environment_error = ENOMEM;
+			return false;
+		}
+		return true;
+	});
+	/* User jobs start in launchd, outside their registering client's inherited
+	 * environment. Retain Darling's explicit executable scopes so the loader
+	 * can select the same compatibility libraries for the service itself. */
+	const char* compatibility_keys[] = {
+		"DARLING_DYLD_OVERRIDE_EXECUTABLES", "DARLING_DYLD_OVERRIDE_LIBRARY_PATH",
+		"DARLING_DYLD_OVERRIDE_FRAMEWORK_PATH",
+	};
+	for (size_t i = 0; !environment_error && i < sizeof(compatibility_keys)/sizeof(*compatibility_keys); ++i) {
+		const char* value = getenv(compatibility_keys[i]);
+		if (!value) continue;
+		launch_data_t text = launch_data_new_string(value);
+		if (!text || !launch_data_dict_insert(environment, text, compatibility_keys[i])) {
+			if (text) launch_data_free(text);
+			environment_error = ENOMEM;
+		}
+	}
+	if (environment_error) { launch_data_free(environment); return environment_error; }
 	launch_data_t job = launch_data_alloc(LAUNCH_DATA_DICTIONARY);
 	launch_data_t args = launch_data_alloc(LAUNCH_DATA_ARRAY);
 	launch_data_t services = launch_data_alloc(LAUNCH_DATA_DICTIONARY);
@@ -65,8 +101,10 @@ static int register_user_service(XPC_CLASS(bundle)* bundle)
 		if (args) launch_data_free(args);
 		if (services) launch_data_free(services);
 		if (request) launch_data_free(request);
+		launch_data_free(environment);
 		return ENOMEM;
 	}
+	launch_data_dict_insert(job, environment, LAUNCH_JOBKEY_ENVIRONMENTVARIABLES);
 	launch_data_dict_insert(job, launch_data_new_string(identifier), LAUNCH_JOBKEY_LABEL);
 	launch_data_dict_insert(job, launch_data_new_string(executable), LAUNCH_JOBKEY_PROGRAM);
 	launch_data_array_set_index(args, launch_data_new_string(executable), 0);

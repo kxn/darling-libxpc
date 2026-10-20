@@ -195,7 +195,7 @@ void xpc_init_services(void) {
 		for (NSBundle* bundle in [bundleClass allFrameworks]) {
 			xpc_add_bundle([[bundle bundlePath] UTF8String], 0);
 		}
-		NSBundle* main = [bundleClass mainBundle];
+		NSBundle* main = (NSBundle*)[bundleClass mainBundle];
 		if (main) xpc_add_bundle([[main bundlePath] UTF8String], 0);
 	}
 };
