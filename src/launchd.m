@@ -60,6 +60,32 @@ static int launchd_routine(int subsystem, int routine, xpc_object_t request, xpc
 	}
 }
 
+/* The original Intel wrappers select subsystem 10. The asynchronous ABI
+ * carries a Mach reply port as its third argument, not a block or queue. */
+XPC_EXPORT
+int _xpc_domain_routine(int routine, xpc_object_t request, xpc_object_t* reply) {
+	return launchd_routine(3, routine, request, reply);
+}
+
+XPC_EXPORT
+int _launch_job_routine(int routine, xpc_object_t request, xpc_object_t* reply) {
+	return launchd_routine(10, routine, request, reply);
+}
+
+XPC_EXPORT
+int _launch_job_routine_async(int routine, xpc_object_t request, mach_port_t reply_port) {
+	if (xpc_get_type(request) != (xpc_type_t)XPC_TYPE_DICTIONARY) return EINVAL;
+	xpc_dictionary_set_uint64(request, "subsystem", 10);
+	xpc_dictionary_set_uint64(request, "routine", routine);
+	@autoreleasepool {
+		XPC_CLASS(pipe)* pipe = [[XPC_CLASS(pipe) alloc] initWithBootstrapPort: bootstrap_port];
+		if (!pipe) return EPIPE;
+		int error = [pipe sendMessage: (id)request withReplyPort: reply_port];
+		[pipe release];
+		return error;
+	}
+}
+
 XPC_EXPORT
 int _xpc_control_routine(int routine, xpc_object_t request, xpc_object_t* reply) {
 	return launchd_routine(XPC_LAUNCH_STATS_SUBSYSTEM, routine, request, reply);
