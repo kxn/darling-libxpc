@@ -43,10 +43,23 @@ static struct os_system_version current_version = {0};
 static dispatch_once_t current_version_once;
 
 XPC_EXPORT
-bool _availability_version_check(size_t version_count, dyld_build_version_t* versions) {
-	// i'm *pretty* sure the second argument is an array of `dyld_build_version_t`
-	xpc_stub();
-	return false;
+int os_system_version_get_current_version(struct os_system_version* out_version);
+
+XPC_EXPORT
+bool _availability_version_check(uint32_t version_count, const dyld_build_version_t* versions) {
+	/* The original Intel ABI uses a 32-bit count and eight-byte platform /
+	 * packed-version records. An absent platform is unconstrained; the first
+	 * matching record decides. This runtime executes macOS host tools. */
+	if (version_count && !versions) return false;
+	for (uint32_t i = 0; i < version_count; ++i) {
+		if (versions[i].platform != PLATFORM_MACOS) continue;
+		struct os_system_version running;
+		if (os_system_version_get_current_version(&running) || running.major > 65535 ||
+		    running.minor > 255 || running.patch > 255) return false;
+		uint32_t packed = (running.major << 16) | (running.minor << 8) | running.patch;
+		return versions[i].version <= packed;
+	}
+	return true;
 };
 
 XPC_EXPORT
