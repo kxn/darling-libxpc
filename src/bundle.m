@@ -81,6 +81,7 @@ static int register_user_service(XPC_CLASS(bundle)* bundle)
 	const char* compatibility_keys[] = {
 		"DARLING_DYLD_OVERRIDE_EXECUTABLES", "DARLING_DYLD_OVERRIDE_LIBRARY_PATH",
 		"DARLING_DYLD_OVERRIDE_FRAMEWORK_PATH",
+		"DARLING_XPC_TRACE_LAUNCH_JOBS",
 	};
 	for (size_t i = 0; !environment_error && i < sizeof(compatibility_keys)/sizeof(*compatibility_keys); ++i) {
 		const char* value = getenv(compatibility_keys[i]);

@@ -32,6 +32,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <stdio.h>
 
 _Static_assert(sizeof(struct launch_service_stats_record) == 59, "native launch record ABI");
 _Static_assert(sizeof(struct launch_service_stats) == 24, "native launch result ABI");
@@ -41,6 +42,13 @@ static int launchd_routine(int subsystem, int routine, xpc_object_t request, xpc
 	*reply = NULL;
 	xpc_dictionary_set_uint64(request, "subsystem", subsystem);
 	xpc_dictionary_set_uint64(request, "routine", routine);
+	/* Explicitly opt in: job dictionaries may contain application data. */
+	const char* trace = getenv("DARLING_XPC_TRACE_LAUNCH_JOBS");
+	if (subsystem == 10 && trace && strcmp(trace, "1") == 0) {
+		char* description = xpc_copy_description(request);
+		fprintf(stderr, "DARLING_XPC_LAUNCH_JOB_REQUEST %s\n", description ?: "(unavailable)");
+		free(description);
+	}
 	@autoreleasepool {
 		XPC_CLASS(pipe)* pipe = [[XPC_CLASS(pipe) alloc] initWithBootstrapPort: bootstrap_port];
 		if (!pipe) return EPIPE;
@@ -60,7 +68,8 @@ static int launchd_routine(int subsystem, int routine, xpc_object_t request, xpc
 	}
 }
 
-/* The original Intel wrappers select subsystem 10. The asynchronous ABI
+/* The original Intel job wrappers select subsystem 10; domain uses 3.
+ * The asynchronous ABI
  * carries a Mach reply port as its third argument, not a block or queue. */
 XPC_EXPORT
 int _xpc_domain_routine(int routine, xpc_object_t request, xpc_object_t* reply) {

@@ -21,6 +21,7 @@
 #import <xpc/objects/string.h>
 #import <xpc/xpc.h>
 #import <xpc/util.h>
+#include <string.h>
 
 XPC_CLASS_SYMBOL_DECL(error);
 
@@ -88,5 +89,9 @@ XPC_CLASS_HEADER(error);
 
 XPC_EXPORT
 const char* xpc_strerror(int error) {
-	return NULL;
+	/* The original Intel implementation delegates ordinary errno values to
+	 * strerror. Launchd reserves 107..165 for its own service errors; do not
+	 * reinterpret these as errno or return NULL to Foundation callers. */
+	if (error >= 107 && error <= 165) return "XPC service error";
+	return strerror(error);
 };
