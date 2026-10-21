@@ -78,7 +78,41 @@ int _xpc_domain_routine(int routine, xpc_object_t request, xpc_object_t* reply) 
 
 XPC_EXPORT
 int _launch_job_routine(int routine, xpc_object_t request, xpc_object_t* reply) {
-	return launchd_routine(10, routine, request, reply);
+	if (!reply || xpc_get_type(request) != (xpc_type_t)XPC_TYPE_DICTIONARY) return EINVAL;
+	*reply = NULL;
+	xpc_object_t forwarded = xpc_retain(request);
+	/* A submitted child starts in launchd rather than in the client's process
+	 * tree. Carry explicit Darling loader scopes just as User bundle jobs do.
+	 * Copy both dictionaries so the caller's plist/environment stay unchanged. */
+	xpc_object_t plist = xpc_dictionary_get_value(request, "plist");
+	if (routine == 1011 && xpc_get_type(plist) == (xpc_type_t)XPC_TYPE_DICTIONARY) {
+		const char* keys[] = { "DARLING_DYLD_OVERRIDE_EXECUTABLES",
+			"DARLING_DYLD_OVERRIDE_LIBRARY_PATH", "DARLING_DYLD_OVERRIDE_FRAMEWORK_PATH",
+			"DARLING_XPC_TRACE_LAUNCH_JOBS" };
+		xpc_object_t environment = NULL;
+		for (size_t i = 0; i < sizeof(keys)/sizeof(*keys); ++i) {
+			const char* value = getenv(keys[i]);
+			if (!value) continue;
+			if (!environment) {
+				xpc_object_t original = xpc_dictionary_get_value(plist, "EnvironmentVariables");
+				if (original && xpc_get_type(original) != (xpc_type_t)XPC_TYPE_DICTIONARY) {
+					xpc_release(forwarded); return EINVAL;
+				}
+				environment = original ? [(XPC_CLASS(dictionary)*)original copy] : xpc_dictionary_create(NULL, NULL, 0);
+			}
+			xpc_dictionary_set_string(environment, keys[i], value);
+		}
+		if (environment) {
+			xpc_object_t scoped_plist = [(XPC_CLASS(dictionary)*)plist copy];
+			xpc_dictionary_set_value(scoped_plist, "EnvironmentVariables", environment);
+			xpc_release(forwarded); forwarded = [(XPC_CLASS(dictionary)*)request copy];
+			xpc_dictionary_set_value(forwarded, "plist", scoped_plist);
+			xpc_release(scoped_plist); xpc_release(environment);
+		}
+	}
+	int error = launchd_routine(10, routine, forwarded, reply);
+	xpc_release(forwarded);
+	return error;
 }
 
 XPC_EXPORT

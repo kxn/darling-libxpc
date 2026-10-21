@@ -29,6 +29,20 @@
 #import <objc/runtime.h>
 #include <Block.h>
 #include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+static void trace_launch_connection(const char* phase, const char* name, bool listener,
+    mach_port_t send, mach_port_t receive, const char* request)
+{
+	const char* enabled = getenv("DARLING_XPC_TRACE_LAUNCH_JOBS");
+	if (!enabled || strcmp(enabled, "1") || !name ||
+	    strncmp(name, "com.apple.CoreSimulator.", 24)) return;
+	fprintf(stderr, "DARLING_XPC_LAUNCH_CONNECTION pid=%d phase=%s name=%s listener=%d send=%u receive=%u request=%s\n",
+	    getpid(), phase, name, listener, send, receive, request ?: "(none)");
+}
 
 XPC_CLASS_SYMBOL_DECL(connection);
 
@@ -632,6 +646,7 @@ OS_OBJECT_USES_XREF_DISPOSE();
 
 		this->is_listener = asServer;
 		this->service_name = serviceName;
+		trace_launch_connection("create", serviceName, asServer, 0, 0, NULL);
 		this->mach_ctx = dispatch_mach_create_4libxpc((asServer ? "org.darlinghq.libxpc.server" : "org.darlinghq.libxpc.client"), queue, self, dispatch_mach_handler);
 	}
 	return self;
@@ -734,6 +749,7 @@ OS_OBJECT_USES_XREF_DISPOSE();
 - (void)activateLocked
 {
 	XPC_THIS_DECL(connection);
+	trace_launch_connection("activate", this->service_name, this->is_listener, this->send_port, this->recv_port, NULL);
 	kern_return_t status = KERN_SUCCESS;
 	dispatch_mach_msg_t checkinMessage = NULL;
 	mach_port_t checkinPort = MACH_PORT_NULL;
@@ -979,6 +995,8 @@ error_out:
 - (xpc_object_t)sendMessageWithSynchronousReply: (XPC_CLASS(dictionary)*)contents
 {
 	XPC_THIS_DECL(connection);
+	trace_launch_connection("sync", this->service_name, this->is_listener, this->send_port, this->recv_port,
+	    xpc_dictionary_get_string((xpc_object_t)contents, "request"));
 	dispatch_mach_msg_t reply = NULL;
 	XPC_CLASS(dictionary)* result = nil;
 	mach_msg_header_t* header = NULL;
