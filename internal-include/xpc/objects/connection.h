@@ -61,7 +61,8 @@ struct xpc_connection_s {
 	//
 	bool is_listener;
 	bool is_server_peer;
-	const char* service_name;
+	// Owned until deallocation; Swift callers often pass a temporary CString.
+	char* service_name;
 	XPC_CLASS(connection)* parent_server;
 
 	//

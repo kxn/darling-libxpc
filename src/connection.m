@@ -605,6 +605,7 @@ OS_OBJECT_USES_XREF_DISPOSE();
 	if (this->finalizer) {
 		this->finalizer(this->user_context);
 	}
+	free(this->service_name);
 
 	[super dealloc];
 }
@@ -639,16 +640,18 @@ OS_OBJECT_USES_XREF_DISPOSE();
 // init helper/common init
 - (instancetype)initForService: (const char*)serviceName queue: (dispatch_queue_t)queue asServer: (BOOL)asServer
 {
+	char* ownedName = serviceName ? strdup(serviceName) : NULL;
+	if (serviceName && !ownedName) xpc_abort("failed to copy connection service name");
 	if (self = [super init]) {
 		XPC_THIS_DECL(connection);
 
 		[self initCommon: queue];
 
 		this->is_listener = asServer;
-		this->service_name = serviceName;
+		this->service_name = ownedName;
 		trace_launch_connection("create", serviceName, asServer, 0, 0, NULL);
 		this->mach_ctx = dispatch_mach_create_4libxpc((asServer ? "org.darlinghq.libxpc.server" : "org.darlinghq.libxpc.client"), queue, self, dispatch_mach_handler);
-	}
+	} else free(ownedName);
 	return self;
 }
 
