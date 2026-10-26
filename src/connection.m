@@ -1036,6 +1036,10 @@ error_out:
 	}
 
 	header = dispatch_mach_msg_get_msg(reply, NULL);
+	audit_token_t* reply_token = get_audit_token(header);
+	if (reply_token) {
+		[self setRemoteCredentials: reply_token];
+	}
 
 	if (header->msgh_size == sizeof(mach_msg_header_t)) {
 		// if the message is only a header, it means that the remote peer disconnected/crashed
@@ -1307,8 +1311,13 @@ void xpc_connection_set_instance(xpc_connection_t xconn, uuid_t uuid) {
 
 XPC_EXPORT
 xpc_object_t xpc_connection_copy_entitlement_value(xpc_connection_t xconn, const char* entitlement) {
-	xpc_stub();
-	return NULL;
+    if (!entitlement) return NULL;
+    TO_OBJC_CHECKED(connection, xconn, conn) {
+        audit_token_t token;
+        [conn copyRemoteCredentials: &token];
+        return xpc_copy_entitlement_for_token(entitlement, &token);
+    }
+    return NULL;
 };
 
 //

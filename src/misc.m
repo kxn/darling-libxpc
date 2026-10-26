@@ -33,9 +33,12 @@
 #include <mach-o/dyld.h>
 #include <mach-o/loader.h>
 #include <xpc/private.h>
+#include <libproc.h>
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
 
-/* Read self signature metadata. Kernel enforcement and foreign audit-token
- * queries are separate interfaces, not implemented by this file reader. */
+/* Read signature metadata matching the loaded executable. This does not
+ * implement certificate trust or kernel entitlement enforcement. */
 static unsigned char *self_entitlement_xml;
 static size_t self_entitlement_xml_size;
 static dispatch_once_t self_entitlement_once;
@@ -56,12 +59,9 @@ static bool self_signature_read(int fd, void *out, size_t size, uint64_t offset,
     }
     return true;
 }
-static void self_signature_load_entitlements(void) {
-    const struct mach_header_64 *live=(const struct mach_header_64 *)_dyld_get_image_header(0);
-    if (!live || live->magic!=MH_MAGIC_64 || live->sizeofcmds>16*1024*1024 || live->ncmds>16384) return;
-    char path[4096];uint32_t path_size=sizeof(path);
-    if (_NSGetExecutablePath(path,&path_size)) return;
-    int fd=open(path,O_RDONLY|O_CLOEXEC);if (fd<0) return;
+static void signature_load_entitlements(int fd, const struct mach_header_64 *live,
+    unsigned char **xml, size_t *xml_size) {
+    if (!live || live->magic!=MH_MAGIC_64 || live->sizeofcmds>16*1024*1024 || live->ncmds>16384) {close(fd);return;}
     unsigned char *commands=NULL,*signature=NULL;struct stat st;
     if (fstat(fd,&st) || st.st_size<32) goto done;
     uint64_t total=(uint64_t)st.st_size,base=0,length=total;unsigned char head[8];
@@ -115,11 +115,18 @@ static void self_signature_load_entitlements(void) {
         }
     }
     if (xml_offset && xml_length) {
-        self_entitlement_xml=malloc(xml_length);
-        if (self_entitlement_xml) {memcpy(self_entitlement_xml,signature+xml_offset,xml_length);self_entitlement_xml_size=xml_length;}
+        *xml=malloc(xml_length);
+        if (*xml) {memcpy(*xml,signature+xml_offset,xml_length);*xml_size=xml_length;}
     }
 done:
     free(signature);free(commands);close(fd);
+}
+static void self_signature_load_entitlements(void) {
+    const struct mach_header_64 *live=(const struct mach_header_64 *)_dyld_get_image_header(0);
+    char path[4096];uint32_t path_size=sizeof(path);
+    if (_NSGetExecutablePath(path,&path_size)) return;
+    int fd=open(path,O_RDONLY|O_CLOEXEC);if (fd<0) return;
+    signature_load_entitlements(fd,live,&self_entitlement_xml,&self_entitlement_xml_size);
 }
 static xpc_object_t self_signature_entitlement_dictionary(void) {
     dispatch_once(&self_entitlement_once, ^{self_signature_load_entitlements();});
@@ -127,6 +134,47 @@ static xpc_object_t self_signature_entitlement_dictionary(void) {
     xpc_object_t dictionary=xpc_create_from_plist(self_entitlement_xml,self_entitlement_xml_size);
     if (dictionary && xpc_get_type(dictionary)!=XPC_TYPE_DICTIONARY) {xpc_release(dictionary);return NULL;}
     return dictionary;
+}
+
+static bool signature_peer_matches(task_t task, const audit_token_t *expected) {
+    audit_token_t actual;mach_msg_type_number_t count=TASK_AUDIT_TOKEN_COUNT;
+    return task_info(task,TASK_AUDIT_TOKEN,(task_info_t)&actual,&count)==KERN_SUCCESS &&
+        count==TASK_AUDIT_TOKEN_COUNT && actual.val[5]==expected->val[5] && actual.val[7]==expected->val[7];
+}
+static bool signature_remote_read(task_t task, uint64_t address, void *out, size_t size) {
+    mach_vm_size_t copied=0;
+    return address && address<=UINT64_MAX-size &&
+        mach_vm_read_overwrite(task,address,size,(mach_vm_address_t)out,&copied)==KERN_SUCCESS && copied==size;
+}
+static xpc_object_t peer_signature_entitlement_dictionary(const audit_token_t *token) {
+    if (!token || (int32_t)token->val[5]<=0 || !token->val[7] || token->val[7]==UINT32_MAX) return NULL;
+    task_t task=MACH_PORT_NULL;
+    if (task_for_pid(mach_task_self(),(pid_t)token->val[5],&task)!=KERN_SUCCESS) return NULL;
+    unsigned char *live=NULL,*xml=NULL;size_t xml_size=0;xpc_object_t result=NULL;
+    struct task_dyld_info dyld;mach_msg_type_number_t count=TASK_DYLD_INFO_COUNT;
+    struct {uint32_t version,count;uint64_t images;} infos;
+    struct {uint64_t header,path,modified;} first;
+    struct mach_header_64 header;
+    char path[PROC_PIDPATHINFO_MAXSIZE],after_path[PROC_PIDPATHINFO_MAXSIZE];
+    if (!signature_peer_matches(task,token) ||
+        proc_pidpath((pid_t)token->val[5],path,sizeof(path))<=0 ||
+        task_info(task,TASK_DYLD_INFO,(task_info_t)&dyld,&count)!=KERN_SUCCESS ||
+        dyld.all_image_info_format!=TASK_DYLD_ALL_IMAGE_INFO_64 ||
+        !signature_remote_read(task,dyld.all_image_info_addr,&infos,sizeof(infos)) || !infos.count || infos.count>16384 ||
+        !signature_remote_read(task,infos.images,&first,sizeof(first)) ||
+        !signature_remote_read(task,first.header,&header,sizeof(header)) || header.magic!=MH_MAGIC_64 ||
+        header.filetype!=MH_EXECUTE || header.sizeofcmds>16*1024*1024 || header.ncmds>16384) goto done;
+    live=malloc(sizeof(header)+header.sizeofcmds);
+    if (!live || !signature_remote_read(task,first.header,live,sizeof(header)+header.sizeofcmds) ||
+        memcmp(live,&header,sizeof(header))) goto done;
+    int fd=open(path,O_RDONLY|O_CLOEXEC);if (fd<0) goto done;
+    signature_load_entitlements(fd,(const struct mach_header_64 *)live,&xml,&xml_size);
+    if (!xml || !signature_peer_matches(task,token) ||
+        proc_pidpath((pid_t)token->val[5],after_path,sizeof(after_path))<=0 || strcmp(path,after_path)) goto done;
+    result=xpc_create_from_plist(xml,xml_size);
+    if (result && xpc_get_type(result)!=XPC_TYPE_DICTIONARY) {xpc_release(result);result=NULL;}
+done:
+    free(xml);free(live);mach_port_deallocate(mach_task_self(),task);return result;
 }
 
 struct os_system_version {
@@ -269,8 +317,11 @@ xpc_object_t xpc_copy_entitlement_for_self(const char* name) {
 
 XPC_EXPORT
 xpc_object_t xpc_copy_entitlement_for_token(const char* name, audit_token_t* token) {
-	xpc_stub();
-	return NULL;
+    if (!name) return NULL;
+    xpc_object_t dictionary=peer_signature_entitlement_dictionary(token);if (!dictionary) return NULL;
+    xpc_object_t value=xpc_dictionary_get_value(dictionary,name);
+    if (value) xpc_retain(value);
+    xpc_release(dictionary);return value;
 };
 
 XPC_EXPORT
