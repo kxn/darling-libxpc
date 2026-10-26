@@ -26,6 +26,109 @@
 
 #include <sys/sysctl.h>
 
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <errno.h>
+#include <mach-o/dyld.h>
+#include <mach-o/loader.h>
+#include <xpc/private.h>
+
+/* Read self signature metadata. Kernel enforcement and foreign audit-token
+ * queries are separate interfaces, not implemented by this file reader. */
+static unsigned char *self_entitlement_xml;
+static size_t self_entitlement_xml_size;
+static dispatch_once_t self_entitlement_once;
+static uint32_t self_signature_be32(const unsigned char *p) {
+    return ((uint32_t)p[0]<<24)|((uint32_t)p[1]<<16)|((uint32_t)p[2]<<8)|p[3];
+}
+static uint64_t self_signature_be64(const unsigned char *p) {
+    return ((uint64_t)self_signature_be32(p)<<32)|self_signature_be32(p+4);
+}
+static bool self_signature_read(int fd, void *out, size_t size, uint64_t offset, uint64_t limit) {
+    if (offset>limit || size>limit-offset || offset>INT64_MAX || size>INT64_MAX-offset) return false;
+    unsigned char *p=out;
+    while (size) {
+        ssize_t n=pread(fd,p,size,(off_t)offset);
+        if (n<0 && errno==EINTR) continue;
+        if (n<=0) return false;
+        p+=n;size-=n;offset+=n;
+    }
+    return true;
+}
+static void self_signature_load_entitlements(void) {
+    const struct mach_header_64 *live=(const struct mach_header_64 *)_dyld_get_image_header(0);
+    if (!live || live->magic!=MH_MAGIC_64 || live->sizeofcmds>16*1024*1024 || live->ncmds>16384) return;
+    char path[4096];uint32_t path_size=sizeof(path);
+    if (_NSGetExecutablePath(path,&path_size)) return;
+    int fd=open(path,O_RDONLY|O_CLOEXEC);if (fd<0) return;
+    unsigned char *commands=NULL,*signature=NULL;struct stat st;
+    if (fstat(fd,&st) || st.st_size<32) goto done;
+    uint64_t total=(uint64_t)st.st_size,base=0,length=total;unsigned char head[8];
+    if (!self_signature_read(fd,head,sizeof(head),0,total)) goto done;
+    uint32_t fat=self_signature_be32(head);
+    if (fat==0xcafebabe || fat==0xcafebabf) {
+        uint32_t count=self_signature_be32(head+4);size_t stride=fat==0xcafebabe?20:32;
+        if (!count || count>4096 || (uint64_t)count*stride>total-8) goto done;
+        bool found=false;
+        for (uint32_t i=0;i<count;++i) {
+            unsigned char arch[32];if (!self_signature_read(fd,arch,stride,8+(uint64_t)i*stride,total)) goto done;
+            if (self_signature_be32(arch)!=(uint32_t)live->cputype ||
+                (self_signature_be32(arch+4)&0xffffff)!=((uint32_t)live->cpusubtype&0xffffff)) continue;
+            if (found) goto done;
+            found=true;base=stride==20?self_signature_be32(arch+8):self_signature_be64(arch+8);
+            length=stride==20?self_signature_be32(arch+12):self_signature_be64(arch+16);
+        }
+        if (!found || base>total || length>total-base) goto done;
+    }
+    struct mach_header_64 disk;
+    if (!self_signature_read(fd,&disk,sizeof(disk),base,total) || disk.magic!=MH_MAGIC_64 ||
+        disk.cputype!=live->cputype || disk.cpusubtype!=live->cpusubtype || disk.ncmds!=live->ncmds ||
+        disk.sizeofcmds!=live->sizeofcmds || length<sizeof(disk) || disk.sizeofcmds>length-sizeof(disk)) goto done;
+    commands=malloc(disk.sizeofcmds);if (!commands || !self_signature_read(fd,commands,disk.sizeofcmds,base+sizeof(disk),total)) goto done;
+    const unsigned char *live_commands=(const unsigned char *)(live+1);
+    size_t at=0;uint32_t sig_offset=0,sig_size=0;bool has_signature=false;
+    for (uint32_t i=0;i<disk.ncmds;++i) {
+        if (at>disk.sizeofcmds || disk.sizeofcmds-at<8) goto done;
+        struct load_command cmd;memcpy(&cmd,commands+at,sizeof(cmd));
+        if (cmd.cmdsize<8 || cmd.cmdsize>disk.sizeofcmds-at || memcmp(commands+at,live_commands+at,cmd.cmdsize)) goto done;
+        if (cmd.cmd==LC_CODE_SIGNATURE) {
+            if (has_signature || cmd.cmdsize!=sizeof(struct linkedit_data_command)) goto done;
+            struct linkedit_data_command s;memcpy(&s,commands+at,sizeof(s));
+            sig_offset=s.dataoff;sig_size=s.datasize;has_signature=true;
+        }
+        at+=cmd.cmdsize;
+    }
+    if (at!=disk.sizeofcmds || !has_signature || sig_size<12 || sig_size>64*1024*1024 ||
+        sig_offset>length || sig_size>length-sig_offset) goto done;
+    signature=malloc(sig_size);if (!signature || !self_signature_read(fd,signature,sig_size,base+sig_offset,total)) goto done;
+    uint32_t blob_length=self_signature_be32(signature+4),count=self_signature_be32(signature+8);
+    if (self_signature_be32(signature)!=0xfade0cc0 || blob_length<12 || blob_length>sig_size || count>(blob_length-12)/8) goto done;
+    uint32_t xml_offset=0,xml_length=0;
+    for (uint32_t i=0;i<count;++i) {
+        const unsigned char *index=signature+12+i*8;uint32_t kind=self_signature_be32(index),offset=self_signature_be32(index+4);
+        if (offset<12+(uint64_t)count*8 || offset>blob_length || blob_length-offset<8) goto done;
+        uint32_t size=self_signature_be32(signature+offset+4);if (size<8 || size>blob_length-offset) goto done;
+        if (kind==5) {
+            if (xml_offset || self_signature_be32(signature+offset)!=0xfade7171) goto done;
+            xml_offset=offset+8;xml_length=size-8;
+        }
+    }
+    if (xml_offset && xml_length) {
+        self_entitlement_xml=malloc(xml_length);
+        if (self_entitlement_xml) {memcpy(self_entitlement_xml,signature+xml_offset,xml_length);self_entitlement_xml_size=xml_length;}
+    }
+done:
+    free(signature);free(commands);close(fd);
+}
+static xpc_object_t self_signature_entitlement_dictionary(void) {
+    dispatch_once(&self_entitlement_once, ^{self_signature_load_entitlements();});
+    if (!self_entitlement_xml) return NULL;
+    xpc_object_t dictionary=xpc_create_from_plist(self_entitlement_xml,self_entitlement_xml_size);
+    if (dictionary && xpc_get_type(dictionary)!=XPC_TYPE_DICTIONARY) {xpc_release(dictionary);return NULL;}
+    return dictionary;
+}
+
 struct os_system_version {
 	unsigned int major;
 	unsigned int minor;
@@ -157,8 +260,11 @@ xpc_object_t place_hold_on_real_loginwindow(void) {
 
 XPC_EXPORT
 xpc_object_t xpc_copy_entitlement_for_self(const char* name) {
-	xpc_stub();
-	return NULL;
+    if (!name) return NULL;
+    xpc_object_t dictionary=self_signature_entitlement_dictionary();if (!dictionary) return NULL;
+    xpc_object_t value=xpc_dictionary_get_value(dictionary,name);
+    if (value) xpc_retain(value);
+    xpc_release(dictionary);return value;
 };
 
 XPC_EXPORT
@@ -183,9 +289,7 @@ xpc_object_t xpc_copy_entitlements_for_pid(pid_t pid) {
 
 XPC_EXPORT
 xpc_object_t xpc_copy_entitlements_for_self(void) {
-	// returns a dictionary
-	xpc_stub();
-	return NULL;
+    return self_signature_entitlement_dictionary();
 };
 
 XPC_EXPORT
