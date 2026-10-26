@@ -472,6 +472,9 @@ xpc_object_t xpc_dictionary_create_reply(xpc_object_t xorig) {
 
 		dict = [XPC_CLASS(dictionary) new];
 
+		// A reply remains associated with the peer that sent the request.
+		// Callers may obtain that peer from the reply before sending it.
+		dict.associatedConnection = orig.associatedConnection;
 		dict.outgoingPort = orig.incomingPort;
 		orig.incomingPort = MACH_PORT_NULL;
 
