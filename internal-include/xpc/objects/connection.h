@@ -46,6 +46,7 @@ XPC_IGNORE_DUPLICATE_PROTOCOL_POP;
 typedef struct xpc_connection_reply_context_s {
 	xpc_handler_t handler;
 	dispatch_queue_t queue;
+	XPC_CLASS(connection)* connection;
 } xpc_connection_reply_context_t;
 
 XPC_GENARR_DECL(connection, XPC_CLASS(connection)*, /* non-static */);

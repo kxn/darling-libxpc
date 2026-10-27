@@ -83,7 +83,7 @@ static void server_peer_array_item_dtor(XPC_CLASS(connection)** serverPeer) {
 	[*serverPeer release];
 };
 
-static xpc_connection_reply_context_t* xpc_connection_reply_context_create(xpc_handler_t handler, dispatch_queue_t queue) {
+static xpc_connection_reply_context_t* xpc_connection_reply_context_create(xpc_handler_t handler, dispatch_queue_t queue, XPC_CLASS(connection)* connection) {
 	xpc_connection_reply_context_t* context = malloc(sizeof(xpc_connection_reply_context_t));
 
 	if (queue == NULL) {
@@ -92,6 +92,10 @@ static xpc_connection_reply_context_t* xpc_connection_reply_context_create(xpc_h
 
 	context->handler = Block_copy(handler);
 	context->queue = [queue retain];
+	/* The asynchronous Mach hook receives this connection as a raw context.
+	 * Keep it alive through delivery/cancellation, even if its caller releases
+	 * the last public reference while the reply is still queued. */
+	context->connection = [connection retain];
 
 	xpc_log_debug(connection, "created reply context %p (with handler %p and queue %p)", context, context->handler, context->queue);
 
@@ -102,6 +106,7 @@ static void xpc_connection_reply_context_destroy(xpc_connection_reply_context_t*
 	xpc_log_debug(connection, "destroying reply context %p (with handler %p and queue %p)", context, context->handler, context->queue);
 	Block_release(context->handler);
 	[context->queue release];
+	[context->connection release];
 	free(context);
 };
 
@@ -984,7 +989,7 @@ error_out:
 			xpc_abort("failed to finalize message");
 		}
 
-		context = xpc_connection_reply_context_create(handler, queue);
+		context = xpc_connection_reply_context_create(handler, queue, self);
 		dispatch_set_context(message, context);
 
 		dispatch_mach_send_with_result_and_async_reply_4libxpc(this->mach_ctx, message, 0, 0, &sendResult, &sendError);
